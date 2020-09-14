@@ -860,7 +860,8 @@ if test x"$with_heif" != x"no"; then
      fi
      have_h265_encoder=`$PKG_CONFIG libheif --variable builtin_h265_encoder`
      have_avif_encoder=`$PKG_CONFIG libheif --variable builtin_avif_encoder`
-     if test x"$have_h265_encoder" != x"no" -o x"$have_avif_encoder" = x"yes"; then
+     have_rav1e_encoder=`$PKG_CONFIG libheif --variable builtin_rav1e_encoder`
+     if test x"$have_h265_encoder" != x"no" -o x"$have_avif_encoder" = x"yes" -o x"$have_rav1e_encoder" = x"yes"; then
         AC_DEFINE(HAVE_HEIF_ENCODER,1,
 	     [define if your libheif has encode support.])
      fi
@@ -872,6 +873,7 @@ if test x"$with_heif" != x"no"; then
      have_h265_encoder=
      have_avif_decoder=
      have_avif_encoder=
+     have_rav1e_encoder=
     ]
   )
 fi
