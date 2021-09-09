@@ -73,6 +73,36 @@ vips_foreign_save_cgif_dispose( GObject *gobject )
 		dispose( gobject );
 }
 
+/**
+ * Extract RGB palette from RGBA palette image.
+ * Caller takes ownership.
+ */
+static uint8_t * get_rgb_palette( VipsImage *in ) {
+	int rgb;
+	int rgba;
+	uint8_t * restrict p_rgba;
+	uint8_t * restrict p_rgb;
+
+	p_rgba = (uint8_t *) VIPS_IMAGE_ADDR( in, 0, 0 );
+	p_rgb = g_malloc0( in->Xsize * 3 );
+	for( rgb = 0, rgba = 0; rgb < in->Xsize * 3; rgb += 3 ) {
+		p_rgb[rgb] = p_rgba[rgba];
+		p_rgb[rgb + 1] = p_rgba[rgba + 1];
+		p_rgb[rgb + 2] = p_rgba[rgba + 2];
+		rgba += 4;
+	}
+	return p_rgb;
+}
+
+/**
+ * Does the RGBA palette image contain a transparent pixel value?
+ * This will always the first entry, if any.
+ */
+static gboolean contains_transparency( VipsImage *in ) {
+	VipsPel *p = VIPS_IMAGE_ADDR( in, 0, 0 );
+	return p[3] == 255 ? FALSE : TRUE;
+}
+
 /* Minimal callback wrapper around vips_target_write
  */
 static int vips__cgif_write( void *target, const uint8_t *buffer,
@@ -87,18 +117,16 @@ vips_foreign_save_cgif_build( VipsObject *object )
 	VipsForeignSave *save = (VipsForeignSave *) object;
 	VipsForeignSaveCgif *cgif = (VipsForeignSaveCgif *) object;
 	VipsImage **t = (VipsImage **) 
-		vips_object_local_array( VIPS_OBJECT( cgif ), 2 );
+		vips_object_local_array( VIPS_OBJECT( cgif ), 3 );
 
-	int rgb;
-	int rgba;
 	gboolean has_transparency;
 	int page_height;
 	int *delay;
 	int delay_length;
 	int loop;
 	int top;
-	uint8_t * restrict paletteRgba;
-	uint8_t * restrict paletteRgb;
+	uint8_t * restrict palette = NULL;
+	gboolean global_palette = FALSE; // TODO: make this configurable
 
 	CGIF *cgif_context;
 	CGIF_Config cgif_config;
@@ -118,64 +146,94 @@ vips_foreign_save_cgif_build( VipsObject *object )
 	if( vips_image_get_typeof( save->ready, "loop" ) )
 		vips_image_get_int( save->ready, "loop", &loop );
 
-	/* Generate indexed image (t[0]) and palette (t[1])
-	 */
-	if( vips__quantise_image( save->ready, &t[0], &t[1],
-		(1 << cgif->bitdepth) - 1, 100, cgif->dither,
-		cgif->effort, TRUE ) )
-		return( -1 );
+	if( global_palette ) {
+		/* Generate indexed image (t[0]) and palette image (t[1])
+		*/
+		if( vips__quantise_image( save->ready, &t[0], &t[1],
+			(1 << cgif->bitdepth) - 1, 100, cgif->dither,
+			cgif->effort, TRUE ) )
+			return( -1 );
 
-	/* Convert palette to RGB
-	 */
-	paletteRgba = (uint8_t *) VIPS_IMAGE_ADDR( t[1], 0, 0 );
-	paletteRgb = g_malloc0( t[1]->Xsize * 3 );
-	for( rgb = 0, rgba = 0; rgb < t[1]->Xsize * 3; rgb += 3 ) {
-		paletteRgb[rgb] = paletteRgba[rgba];
-		paletteRgb[rgb + 1] = paletteRgba[rgba + 1];
-		paletteRgb[rgb + 2] = paletteRgba[rgba + 2];
-		rgba += 4;
+		/* Convert palette to RGB
+		*/
+		palette = get_rgb_palette( t[1] );
+		has_transparency = contains_transparency( t[1] );
 	}
-
-	/* Does the palette contain a transparent pixel value? This will 
-	 * always the first entry, if any.
-	 */
-	has_transparency = paletteRgba[3] == 255 ? FALSE : TRUE;
 
 	/* Initiialise cgif
 	 */
 	memset( &cgif_config, 0, sizeof( CGIF_Config ) );
-	cgif_config.width = t[0]->Xsize;
+	cgif_config.width = save->ready->Xsize;
 	cgif_config.height = page_height;
-	cgif_config.pGlobalPalette = paletteRgb;
-	cgif_config.numGlobalPaletteEntries = t[1]->Xsize;
 	cgif_config.numLoops = loop;
 	cgif_config.attrFlags = CGIF_ATTR_IS_ANIMATED;
-	if( has_transparency ) 
-		cgif_config.attrFlags |= CGIF_ATTR_HAS_TRANSPARENCY;
 	cgif_config.pWriteFn = vips__cgif_write;
 	cgif_config.pContext = (void *) cgif->target;
+	if( global_palette ) {
+		cgif_config.pGlobalPalette = palette;
+		cgif_config.numGlobalPaletteEntries = t[1]->Xsize;
+		if( has_transparency )
+			cgif_config.attrFlags |= CGIF_ATTR_HAS_TRANSPARENCY;
+	} else {
+		cgif_config.attrFlags |= CGIF_ATTR_NO_GLOBAL_TABLE;
+	}
 	cgif_context = cgif_newgif( &cgif_config );
-	g_free( paletteRgb );
+	g_free( palette );
 
 	/* Add each vips page as a cgif frame
 	 */
-	for( top = 0; top < t[0]->Ysize; top += page_height ) {
+	for( top = 0; top < save->ready->Ysize; top += page_height ) {
+		VipsImage *frame;
+		VipsImage *frame_index;
+		VipsImage *frame_palette;
 		int page_index = top / page_height;
 
 		memset( &cgif_frame_config, 0, sizeof( CGIF_FrameConfig ) );
-		cgif_frame_config.pImageData = (uint8_t *)
-			VIPS_IMAGE_ADDR( t[0], 0, top );
+		if( !global_palette ) {
+			/* Quantise current frame.
+			 */
+			if( vips_extract_area( save->ready, &frame,
+				0, top, save->ready->Xsize, page_height, NULL ) )
+				return( -1 );
+			if( vips__quantise_image( frame, &frame_index, &frame_palette,
+				255, 100, cgif->dither, cgif->effort, TRUE ) ) {
+				g_object_unref( frame );
+				return( -1 );
+			}
+			cgif_frame_config.pImageData = (uint8_t *)
+				VIPS_IMAGE_ADDR( frame_index, 0, 0 );
+			palette = get_rgb_palette( frame_palette );
+			cgif_frame_config.pLocalPalette = palette;
+			cgif_frame_config.numLocalPaletteEntries =
+				frame_palette->Xsize;
+			cgif_frame_config.attrFlags =
+				CGIF_FRAME_ATTR_USE_LOCAL_TABLE;
+			has_transparency = contains_transparency(
+				frame_palette );
+		} else {
+			cgif_frame_config.pImageData = (uint8_t *)
+				VIPS_IMAGE_ADDR( t[0], 0, top );
+		}
 		if( delay &&
 			page_index < delay_length )
 			cgif_frame_config.delay =
 				VIPS_RINT( delay[page_index] / 10.0 );
-		if( !has_transparency ) 
+		if( has_transparency )
+			cgif_context->config.attrFlags |= CGIF_ATTR_HAS_TRANSPARENCY;
+		else
 			/* Allow cgif to optimise by adding transparency
 			 */
 			cgif_frame_config.genFlags = 
 				CGIF_FRAME_GEN_USE_TRANSPARENCY |
 				CGIF_FRAME_GEN_USE_DIFF_WINDOW;
 		cgif_addframe( cgif_context, &cgif_frame_config );
+
+		if( !global_palette ) {
+			g_object_unref( frame );
+			g_object_unref( frame_index );
+			g_object_unref( frame_palette );
+			g_free(palette);
+		}
 	}
 
 	cgif_close( cgif_context );
