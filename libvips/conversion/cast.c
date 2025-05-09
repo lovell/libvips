@@ -159,7 +159,7 @@ G_DEFINE_TYPE(VipsCast, vips_cast, VIPS_TYPE_CONVERSION);
 		g_assert(sizeof(ITYPE) <= sizeof(OTYPE)); \
 \
 		for (x = 0; x < sz; x++) \
-			q[x] = (p[x] << n) | (((p[x] & 1) << n) - (p[x] & 1)); \
+			q[x] = (((OTYPE) p[x]) << n) | (((p[x] & 1U) << n) - (p[x] & 1U)); \
 	}
 
 #define SHIFT_LEFT_SIGNED(ITYPE, OTYPE) \
